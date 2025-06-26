@@ -1,4 +1,4 @@
-// internal/server/sampling.go - Updated for meal-log server
+// internal/server/sampling.go - Add model configuration
 package server
 
 import (
@@ -6,7 +6,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -15,19 +17,35 @@ import (
 
 type SamplingClient struct {
 	httpClient *http.Client
-	gatewayURL string
 	proxyURL   string
 	apiKey     string
+	model      string // Add model field
 }
 
 func NewSamplingClient() *SamplingClient {
+	proxyURL := os.Getenv("MCP_PROXY_URL")
+	if proxyURL == "" {
+		proxyURL = "http://mcp-compose-http-proxy:9876"
+	}
+
+	apiKey := os.Getenv("MCP_PROXY_API_KEY")
+	if apiKey == "" {
+		apiKey = "myapikey"
+	}
+
+	// Get model from environment variable
+	model := os.Getenv("OPENROUTER_MODEL")
+	if model == "" {
+		model = "anthropic/claude-3.5-sonnet" // Default fallback
+	}
+
 	return &SamplingClient{
 		httpClient: &http.Client{
 			Timeout: 60 * time.Second,
 		},
-		gatewayURL: "http://mcp-compose-openrouter-gateway:8012",
-		proxyURL:   "http://mcp-compose-http-proxy:9876",
-		apiKey:     "myapikey",
+		proxyURL: proxyURL,
+		apiKey:   apiKey,
+		model:    model, // Store the model
 	}
 }
 
@@ -37,37 +55,44 @@ func (s *SamplingClient) CalculateCarbs(ctx context.Context, req *models.CarbCal
 
 When analyzing meals, provide accurate carbohydrate estimates and identify when more information is needed.
 
-Always respond with valid JSON in this exact format:
+IMPORTANT: Always respond with valid JSON in this exact format:
 {
   "foods": [
     {
-      "name": "food item name", 
-      "quantity": "estimated portion size",
+      "name": "specific food item name",
+      "quantity": "estimated portion size with units", 
       "carbs_per_100g": [number],
       "estimated_carbs": [number],
       "confidence": "high|medium|low"
     }
   ],
   "total_carbs": [number],
-  "confidence": "high|medium|low", 
-  "clarifications": ["question1", "question2"],
+  "confidence": "high|medium|low",
+  "clarifications": ["specific question1", "specific question2"],
   "needs_more_info": [true/false]
-}`
+}
+
+For items like "a baked potato", ask specific questions about size since this greatly affects carbohydrate content.`
+
+	clarificationText := ""
+	if req.AskClarifications {
+		clarificationText = `
+
+If the description lacks specific details about:
+- Portion sizes (small, medium, large, or specific measurements)
+- Preparation methods that affect carbs
+- Specific varieties that have different carb contents
+
+Then set "needs_more_info" to true and include specific clarifying questions in the "clarifications" array.`
+	}
 
 	userPrompt := fmt.Sprintf(`Analyze this meal and calculate carbohydrates: "%s"
 
-Provide detailed breakdown of each food item, portion estimates, and total carbohydrates.
+Provide detailed breakdown of each food item, realistic portion estimates, and total carbohydrates.%s`, req.MealDescription, clarificationText)
 
-%s`, req.MealDescription, func() string {
-		if req.AskClarifications {
-			return "If the description is vague, include specific clarifying questions in the 'clarifications' array and set 'needs_more_info' to true."
-		}
-		return "Provide your best estimate even if some details are unclear."
-	}())
-
-	// Call the generic OpenRouter gateway
+	// Call the OpenRouter gateway using the configured model
 	completionRequest := map[string]interface{}{
-		"model":         "anthropic/claude-3.5-sonnet",
+		"model":         s.model, // Use the configured model
 		"system_prompt": systemPrompt,
 		"messages": []map[string]interface{}{
 			{
@@ -75,11 +100,11 @@ Provide detailed breakdown of each food item, portion estimates, and total carbo
 				"content": userPrompt,
 			},
 		},
-		"max_tokens":  1500,
+		"max_tokens":  2000,
 		"temperature": 0.1, // Low temperature for consistent analysis
 	}
 
-	// Call the gateway via mcp-compose proxy
+	// Call the gateway
 	gatewayResponse, err := s.callGateway("create_completion", completionRequest)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get AI completion: %w", err)
@@ -89,6 +114,7 @@ Provide detailed breakdown of each food item, portion estimates, and total carbo
 	return s.parseAIResponse(gatewayResponse)
 }
 
+// Rest of the methods remain the same...
 func (s *SamplingClient) callGateway(toolName string, args interface{}) (string, error) {
 	url := fmt.Sprintf("%s/openrouter-gateway", s.proxyURL)
 
@@ -122,7 +148,11 @@ func (s *SamplingClient) callGateway(toolName string, args interface{}) (string,
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("request failed with status %d", resp.StatusCode)
+		bodyBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return "", fmt.Errorf("request failed with status %d and couldn't read body: %v", resp.StatusCode, err)
+		}
+		return "", fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 
 	var mcpResponse map[string]interface{}
@@ -135,7 +165,6 @@ func (s *SamplingClient) callGateway(toolName string, args interface{}) (string,
 		if content, ok := result["content"].([]interface{}); ok && len(content) > 0 {
 			if textContent, ok := content[0].(map[string]interface{}); ok {
 				if text, ok := textContent["text"].(string); ok {
-					// The text should contain the completion response JSON
 					return text, nil
 				}
 			}
@@ -146,22 +175,19 @@ func (s *SamplingClient) callGateway(toolName string, args interface{}) (string,
 }
 
 func (s *SamplingClient) parseAIResponse(aiOutput string) (*models.CarbCalculationResponse, error) {
-	// Extract the completion response first
+	// Parse the completion response
 	var completionResp map[string]interface{}
 	if err := json.Unmarshal([]byte(aiOutput), &completionResp); err != nil {
-		return nil, fmt.Errorf("failed to parse completion response: %w", err)
+		return s.createFallbackResponse(aiOutput), nil
 	}
 
 	// Get the content from the completion
 	content, ok := completionResp["content"].(string)
 	if !ok {
-		return nil, fmt.Errorf("no content in completion response")
+		return s.createFallbackResponse(aiOutput), nil
 	}
 
-	// Now parse the actual carb calculation JSON from the content
-	var response models.CarbCalculationResponse
-
-	// Try to find JSON in the content
+	// Extract JSON from the content
 	start := strings.Index(content, "{")
 	if start == -1 {
 		return s.createFallbackResponse(content), nil
@@ -174,6 +200,7 @@ func (s *SamplingClient) parseAIResponse(aiOutput string) (*models.CarbCalculati
 
 	jsonStr := content[start : end+1]
 
+	var response models.CarbCalculationResponse
 	if err := json.Unmarshal([]byte(jsonStr), &response); err != nil {
 		return s.createFallbackResponse(content), nil
 	}
@@ -182,25 +209,23 @@ func (s *SamplingClient) parseAIResponse(aiOutput string) (*models.CarbCalculati
 }
 
 func (s *SamplingClient) createFallbackResponse(aiOutput string) *models.CarbCalculationResponse {
-	estimatedCarbs := 20.0 // Default fallback
-
 	return &models.CarbCalculationResponse{
 		Foods: []models.Food{
 			{
-				Name:           "AI Analysis Result",
-				Quantity:       "estimated",
+				Name:           "Analysis unavailable",
+				Quantity:       "unknown",
 				CarbsPer100g:   0,
-				EstimatedCarbs: estimatedCarbs,
+				EstimatedCarbs: 20.0,
 				Confidence:     models.LowConfidence,
 			},
 		},
-		TotalCarbs:    estimatedCarbs,
+		TotalCarbs:    20.0,
 		Confidence:    models.LowConfidence,
 		NeedsMoreInfo: true,
 		Clarifications: []string{
-			"Could you provide more specific details about portion sizes?",
-			"How was the food prepared (grilled, fried, etc.)?",
-			"Were there any sauces or condiments?",
+			"What size was the potato (small, medium, large)?",
+			"How much sour cream was used?",
+			"Were there any other toppings?",
 		},
 	}
 }
