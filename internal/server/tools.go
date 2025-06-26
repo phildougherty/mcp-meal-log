@@ -8,58 +8,49 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ThinkInAIXYZ/go-mcp/protocol"
-
 	"mcp-meal-log/internal/models"
 )
 
 type LogMealParams struct {
-	Description string `json:"description" description:"Description of the meal eaten"`
-	Timestamp   string `json:"timestamp,omitempty" description:"ISO timestamp of when meal was eaten (defaults to now)"`
+	Description string `json:"description"`
+	Timestamp   string `json:"timestamp,omitempty"`
 }
 
 type CalculateCarbsParams struct {
-	MealDescription   string `json:"meal_description" description:"Description of the meal to analyze"`
-	AskClarifications bool   `json:"ask_clarifications" description:"Whether to ask clarifying questions if needed"`
+	MealDescription   string `json:"meal_description"`
+	AskClarifications bool   `json:"ask_clarifications"`
 }
 
 type GetMealsParams struct {
-	StartDate string `json:"start_date,omitempty" description:"Start date for meal query (YYYY-MM-DD)"`
-	EndDate   string `json:"end_date,omitempty" description:"End date for meal query (YYYY-MM-DD)"`
-	Limit     int    `json:"limit,omitempty" description:"Maximum number of meals to return"`
+	StartDate string `json:"start_date,omitempty"`
+	EndDate   string `json:"end_date,omitempty"`
+	Limit     int    `json:"limit,omitempty"`
 }
 
-// extractParams safely extracts parameters from the request arguments
-func extractParams(req *protocol.CallToolRequest, target interface{}) error {
-	// Convert the Arguments map to JSON bytes, then unmarshal to target
-	jsonBytes, err := json.Marshal(req.Arguments)
+// helper function to convert map to struct
+func mapToStruct(data map[string]interface{}, target interface{}) error {
+	jsonBytes, err := json.Marshal(data)
 	if err != nil {
-		return fmt.Errorf("failed to marshal arguments: %w", err)
+		return err
 	}
-
-	if err := json.Unmarshal(jsonBytes, target); err != nil {
-		return fmt.Errorf("failed to unmarshal parameters: %w", err)
-	}
-
-	return nil
+	return json.Unmarshal(jsonBytes, target)
 }
 
-// handleLogMeal processes meal logging with AI-powered carb calculation
-func (s *MealLogServer) handleLogMeal(req *protocol.CallToolRequest) (*protocol.CallToolResult, error) {
-	var params LogMealParams
-	if err := extractParams(req, &params); err != nil {
+func (s *MealLogServer) logMeal(params map[string]interface{}) (interface{}, error) {
+	var p LogMealParams
+	if err := mapToStruct(params, &p); err != nil {
 		return nil, fmt.Errorf("invalid parameters: %w", err)
 	}
 
-	if params.Description == "" {
+	if p.Description == "" {
 		return nil, fmt.Errorf("meal description is required")
 	}
 
 	// Parse timestamp or use current time
 	var timestamp time.Time
 	var err error
-	if params.Timestamp != "" {
-		timestamp, err = time.Parse(time.RFC3339, params.Timestamp)
+	if p.Timestamp != "" {
+		timestamp, err = time.Parse(time.RFC3339, p.Timestamp)
 		if err != nil {
 			return nil, fmt.Errorf("invalid timestamp format: %w", err)
 		}
@@ -69,7 +60,7 @@ func (s *MealLogServer) handleLogMeal(req *protocol.CallToolRequest) (*protocol.
 
 	// Use AI to calculate carbs
 	carbReq := &models.CarbCalculationRequest{
-		MealDescription:   params.Description,
+		MealDescription:   p.Description,
 		AskClarifications: true,
 	}
 
@@ -80,18 +71,17 @@ func (s *MealLogServer) handleLogMeal(req *protocol.CallToolRequest) (*protocol.
 
 	// If clarifications are needed, return them instead of logging
 	if carbResp.NeedsMoreInfo && len(carbResp.Clarifications) > 0 {
-		result := map[string]interface{}{
+		return map[string]interface{}{
 			"needs_clarification":  true,
 			"clarifications":       carbResp.Clarifications,
 			"preliminary_analysis": carbResp,
-		}
-		return s.createJSONResponse(result)
+		}, nil
 	}
 
 	// Create meal entry
 	meal := &models.Meal{
 		ID:          fmt.Sprintf("meal_%d", time.Now().UnixNano()),
-		Description: params.Description,
+		Description: p.Description,
 		Timestamp:   timestamp,
 		Foods:       carbResp.Foods,
 		TotalCarbs:  carbResp.TotalCarbs,
@@ -112,23 +102,22 @@ func (s *MealLogServer) handleLogMeal(req *protocol.CallToolRequest) (*protocol.
 		fmt.Printf("Warning: failed to add meal to knowledge graph: %v\n", err)
 	}
 
-	return s.createJSONResponse(meal)
+	return meal, nil
 }
 
-// handleCalculateCarbs calculates carbs without logging the meal
-func (s *MealLogServer) handleCalculateCarbs(req *protocol.CallToolRequest) (*protocol.CallToolResult, error) {
-	var params CalculateCarbsParams
-	if err := extractParams(req, &params); err != nil {
+func (s *MealLogServer) calculateCarbs(params map[string]interface{}) (interface{}, error) {
+	var p CalculateCarbsParams
+	if err := mapToStruct(params, &p); err != nil {
 		return nil, fmt.Errorf("invalid parameters: %w", err)
 	}
 
-	if params.MealDescription == "" {
+	if p.MealDescription == "" {
 		return nil, fmt.Errorf("meal description is required")
 	}
 
 	carbReq := &models.CarbCalculationRequest{
-		MealDescription:   params.MealDescription,
-		AskClarifications: params.AskClarifications,
+		MealDescription:   p.MealDescription,
+		AskClarifications: p.AskClarifications,
 	}
 
 	result, err := s.samplingClient.CalculateCarbs(context.Background(), carbReq)
@@ -136,30 +125,28 @@ func (s *MealLogServer) handleCalculateCarbs(req *protocol.CallToolRequest) (*pr
 		return nil, fmt.Errorf("failed to calculate carbs: %w", err)
 	}
 
-	return s.createJSONResponse(result)
+	return result, nil
 }
 
-// handleGetMeals retrieves meals from storage
-func (s *MealLogServer) handleGetMeals(req *protocol.CallToolRequest) (*protocol.CallToolResult, error) {
-	var params GetMealsParams
-	if err := extractParams(req, &params); err != nil {
+func (s *MealLogServer) getMeals(params map[string]interface{}) (interface{}, error) {
+	var p GetMealsParams
+	if err := mapToStruct(params, &p); err != nil {
 		return nil, fmt.Errorf("invalid parameters: %w", err)
 	}
 
 	// Set defaults
-	if params.Limit <= 0 {
-		params.Limit = 20
+	if p.Limit <= 0 {
+		p.Limit = 20
 	}
 
-	meals, err := s.storage.GetMeals(params.StartDate, params.EndDate, params.Limit)
+	meals, err := s.storage.GetMeals(p.StartDate, p.EndDate, p.Limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to retrieve meals: %w", err)
 	}
 
-	return s.createJSONResponse(meals)
+	return meals, nil
 }
 
-// addMealToKnowledgeGraph integrates with your existing knowledge graph system
 func (s *MealLogServer) addMealToKnowledgeGraph(meal *models.Meal) error {
 	// Call the memory MCP server via mcp-compose proxy to create entities
 	entityData := map[string]interface{}{
@@ -197,22 +184,4 @@ func (s *MealLogServer) callMemoryService(toolName string, data interface{}) err
 	// This would make HTTP requests to the memory service
 	fmt.Printf("Would call memory service %s with data: %+v\n", toolName, data)
 	return nil // Placeholder
-}
-
-// Register all tools - simplified without protocol.NewTool
-func (s *MealLogServer) registerTools() error {
-	// Since we're handling tools manually in the HTTP handler,
-	// this is just for validation that our tool handlers exist
-	tools := map[string]func(*protocol.CallToolRequest) (*protocol.CallToolResult, error){
-		"log_meal":        s.handleLogMeal,
-		"calculate_carbs": s.handleCalculateCarbs,
-		"get_meals":       s.handleGetMeals,
-	}
-
-	// Just verify all handlers are present
-	for name := range tools {
-		fmt.Printf("Registered tool: %s\n", name)
-	}
-
-	return nil
 }

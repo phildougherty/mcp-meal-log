@@ -8,9 +8,6 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/ThinkInAIXYZ/go-mcp/protocol"
-	"github.com/ThinkInAIXYZ/go-mcp/server"
-
 	"mcp-meal-log/internal/storage"
 )
 
@@ -22,11 +19,27 @@ type Config struct {
 }
 
 type MealLogServer struct {
-	server         *server.Server
 	httpServer     *http.Server
 	storage        *storage.SQLiteStorage
 	samplingClient *SamplingClient
 	config         *Config
+}
+
+// MCPRequest represents a simplified MCP tool call request
+type MCPRequest struct {
+	Method string                 `json:"method"`
+	Params map[string]interface{} `json:"params"`
+}
+
+// MCPResponse represents a simplified MCP response
+type MCPResponse struct {
+	Result interface{} `json:"result,omitempty"`
+	Error  *MCPError   `json:"error,omitempty"`
+}
+
+type MCPError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
 }
 
 func NewMealLogServer(cfg *Config) (*MealLogServer, error) {
@@ -42,30 +55,12 @@ func NewMealLogServer(cfg *Config) (*MealLogServer, error) {
 		config:         cfg,
 	}
 
-	// Create HTTP server with MCP handler
-	mux := http.NewServeMux()
-
-	// Create MCP server (without transport, we'll handle HTTP manually)
-	mcpServer, err := server.NewServer(
-		nil, // We'll handle transport manually
-		server.WithServerInfo(protocol.Implementation{
-			Name:    "meal-log",
-			Version: "1.0.0",
-		}),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create MCP server: %w", err)
-	}
-
-	mealServer.server = mcpServer
-
-	// Register tools
-	if err := mealServer.registerTools(); err != nil {
-		return nil, fmt.Errorf("failed to register tools: %w", err)
-	}
-
 	// Set up HTTP handlers
+	mux := http.NewServeMux()
 	mux.HandleFunc("/", mealServer.handleHTTP)
+	mux.HandleFunc("/log_meal", mealServer.handleLogMealHTTP)
+	mux.HandleFunc("/calculate_carbs", mealServer.handleCalculateCarbsHTTP)
+	mux.HandleFunc("/get_meals", mealServer.handleGetMealsHTTP)
 
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	mealServer.httpServer = &http.Server{
@@ -73,57 +68,138 @@ func NewMealLogServer(cfg *Config) (*MealLogServer, error) {
 		Handler: mux,
 	}
 
+	log.Printf("Meal log server configured on %s", addr)
 	return mealServer, nil
 }
 
 func (s *MealLogServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
-	// Simple HTTP-based MCP protocol handler
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-
+	// Handle CORS
+	s.setCORSHeaders(w)
 	if r.Method == http.MethodOptions {
 		return
 	}
 
-	// Decode the MCP request
-	var request protocol.CallToolRequest
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-		http.Error(w, fmt.Sprintf("Invalid JSON: %v", err), http.StatusBadRequest)
+	if r.Method != http.MethodPost {
+		s.sendError(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
 
-	// Route to appropriate handler based on tool name
-	var result *protocol.CallToolResult
+	// Decode the request
+	var request MCPRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		s.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
+		return
+	}
+
+	// Route to appropriate handler
+	var result interface{}
 	var err error
 
-	switch request.Name {
+	switch request.Method {
 	case "log_meal":
-		result, err = s.handleLogMeal(&request)
+		result, err = s.logMeal(request.Params)
 	case "calculate_carbs":
-		result, err = s.handleCalculateCarbs(&request)
+		result, err = s.calculateCarbs(request.Params)
 	case "get_meals":
-		result, err = s.handleGetMeals(&request)
+		result, err = s.getMeals(request.Params)
 	default:
-		http.Error(w, fmt.Sprintf("Unknown tool: %s", request.Name), http.StatusNotFound)
+		s.sendError(w, http.StatusNotFound, fmt.Sprintf("Unknown method: %s", request.Method))
 		return
 	}
 
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		s.sendError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	// Send response
-	if err := json.NewEncoder(w).Encode(result); err != nil {
-		log.Printf("Failed to encode response: %v", err)
+	// Send success response
+	response := MCPResponse{Result: result}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func (s *MealLogServer) handleLogMealHTTP(w http.ResponseWriter, r *http.Request) {
+	s.setCORSHeaders(w)
+	if r.Method == http.MethodOptions {
+		return
 	}
+
+	var params map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&params); err != nil {
+		s.sendError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	result, err := s.logMeal(params)
+	if err != nil {
+		s.sendError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+func (s *MealLogServer) handleCalculateCarbsHTTP(w http.ResponseWriter, r *http.Request) {
+	s.setCORSHeaders(w)
+	if r.Method == http.MethodOptions {
+		return
+	}
+
+	var params map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&params); err != nil {
+		s.sendError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	result, err := s.calculateCarbs(params)
+	if err != nil {
+		s.sendError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+func (s *MealLogServer) handleGetMealsHTTP(w http.ResponseWriter, r *http.Request) {
+	s.setCORSHeaders(w)
+	if r.Method == http.MethodOptions {
+		return
+	}
+
+	var params map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&params); err != nil {
+		s.sendError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	result, err := s.getMeals(params)
+	if err != nil {
+		s.sendError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+func (s *MealLogServer) setCORSHeaders(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+}
+
+func (s *MealLogServer) sendError(w http.ResponseWriter, statusCode int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	response := MCPResponse{
+		Error: &MCPError{
+			Code:    statusCode,
+			Message: message,
+		},
+	}
+	json.NewEncoder(w).Encode(response)
 }
 
 func (s *MealLogServer) Start(ctx context.Context) error {
@@ -142,21 +218,4 @@ func (s *MealLogServer) Stop() error {
 		return s.httpServer.Shutdown(context.Background())
 	}
 	return nil
-}
-
-func (s *MealLogServer) createJSONResponse(data interface{}) (*protocol.CallToolResult, error) {
-	jsonBytes, err := json.Marshal(data)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal response: %w", err)
-	}
-
-	// Fixed: Use proper protocol.Content types
-	return &protocol.CallToolResult{
-		Content: []protocol.Content{
-			protocol.TextContent{
-				Type: "text",
-				Text: string(jsonBytes),
-			},
-		},
-	}, nil
 }
