@@ -7,30 +7,51 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mcp-meal-log/internal/models"
 	"net/http"
 	"os"
 	"strings"
 	"time"
-
-	"mcp-meal-log/internal/models"
 )
 
 type SamplingClient struct {
 	httpClient *http.Client
-	proxyURL   string
+	gatewayURL string
 	apiKey     string
-	model      string // Add model field
+	model      string
 }
 
 func NewSamplingClient() *SamplingClient {
-	proxyURL := os.Getenv("MCP_PROXY_URL")
-	if proxyURL == "" {
-		proxyURL = "http://mcp-compose-http-proxy:9876"
+	// Try direct gateway URL first, fallback to proxy if not set
+	gatewayURL := os.Getenv("OPENROUTER_GATEWAY_URL")
+	if gatewayURL == "" {
+		// Check if we have a proxy URL and gateway service name
+		proxyURL := os.Getenv("MCP_PROXY_URL")
+		gatewayService := os.Getenv("OPENROUTER_GATEWAY_SERVICE")
+		gatewayPort := os.Getenv("OPENROUTER_GATEWAY_PORT")
+
+		if gatewayService != "" {
+			// Direct service access
+			port := "8012"
+			if gatewayPort != "" {
+				port = gatewayPort
+			}
+			gatewayURL = fmt.Sprintf("http://%s:%s", gatewayService, port)
+		} else if proxyURL != "" {
+			// Via proxy
+			gatewayURL = fmt.Sprintf("%s/openrouter-gateway", proxyURL)
+		} else {
+			// Final fallback - use Docker Compose service name
+			gatewayURL = "http://mcp-compose-openrouter-gateway:8012"
+		}
 	}
 
 	apiKey := os.Getenv("MCP_PROXY_API_KEY")
 	if apiKey == "" {
-		apiKey = "myapikey"
+		apiKey = os.Getenv("OPENROUTER_API_KEY")
+		if apiKey == "" {
+			apiKey = "myapikey"
+		}
 	}
 
 	// Get model from environment variable
@@ -43,18 +64,16 @@ func NewSamplingClient() *SamplingClient {
 		httpClient: &http.Client{
 			Timeout: 60 * time.Second,
 		},
-		proxyURL: proxyURL,
-		apiKey:   apiKey,
-		model:    model, // Store the model
+		gatewayURL: gatewayURL,
+		apiKey:     apiKey,
+		model:      model,
 	}
 }
 
 func (s *SamplingClient) CalculateCarbs(ctx context.Context, req *models.CarbCalculationRequest) (*models.CarbCalculationResponse, error) {
 	// Create a specialized prompt for carb analysis
 	systemPrompt := `You are a nutrition expert specializing in carbohydrate counting for diabetes management. 
-
 When analyzing meals, provide accurate carbohydrate estimates and identify when more information is needed.
-
 IMPORTANT: Always respond with valid JSON in this exact format:
 {
   "foods": [
@@ -71,23 +90,19 @@ IMPORTANT: Always respond with valid JSON in this exact format:
   "clarifications": ["specific question1", "specific question2"],
   "needs_more_info": [true/false]
 }
-
 For items like "a baked potato", ask specific questions about size since this greatly affects carbohydrate content.`
 
 	clarificationText := ""
 	if req.AskClarifications {
 		clarificationText = `
-
 If the description lacks specific details about:
 - Portion sizes (small, medium, large, or specific measurements)
 - Preparation methods that affect carbs
 - Specific varieties that have different carb contents
-
 Then set "needs_more_info" to true and include specific clarifying questions in the "clarifications" array.`
 	}
 
 	userPrompt := fmt.Sprintf(`Analyze this meal and calculate carbohydrates: "%s"
-
 Provide detailed breakdown of each food item, realistic portion estimates, and total carbohydrates.%s`, req.MealDescription, clarificationText)
 
 	// Call the OpenRouter gateway using the configured model
@@ -114,18 +129,37 @@ Provide detailed breakdown of each food item, realistic portion estimates, and t
 	return s.parseAIResponse(gatewayResponse)
 }
 
-// Rest of the methods remain the same...
 func (s *SamplingClient) callGateway(toolName string, args interface{}) (string, error) {
-	url := fmt.Sprintf("%s/openrouter-gateway", s.proxyURL)
+	// Use the gateway URL directly (could be direct service or via proxy)
+	url := s.gatewayURL
 
-	requestData := map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  "tools/call",
-		"params": map[string]interface{}{
-			"name":      toolName,
-			"arguments": args,
-		},
+	// Determine if we're calling through proxy or directly
+	isProxyCall := strings.Contains(url, "/openrouter-gateway")
+
+	var requestData map[string]interface{}
+
+	if isProxyCall {
+		// Going through MCP proxy - use MCP protocol
+		requestData = map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      1,
+			"method":  "tools/call",
+			"params": map[string]interface{}{
+				"name":      toolName,
+				"arguments": args,
+			},
+		}
+	} else {
+		// Direct call to gateway - use MCP protocol as well since gateway expects it
+		requestData = map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      1,
+			"method":  "tools/call",
+			"params": map[string]interface{}{
+				"name":      toolName,
+				"arguments": args,
+			},
+		}
 	}
 
 	jsonData, err := json.Marshal(requestData)
@@ -139,7 +173,11 @@ func (s *SamplingClient) callGateway(toolName string, args interface{}) (string,
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+s.apiKey)
+
+	// Only set authorization if going through proxy
+	if isProxyCall {
+		req.Header.Set("Authorization", "Bearer "+s.apiKey)
+	}
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
@@ -192,14 +230,12 @@ func (s *SamplingClient) parseAIResponse(aiOutput string) (*models.CarbCalculati
 	if start == -1 {
 		return s.createFallbackResponse(content), nil
 	}
-
 	end := strings.LastIndex(content, "}")
 	if end == -1 || end <= start {
 		return s.createFallbackResponse(content), nil
 	}
 
 	jsonStr := content[start : end+1]
-
 	var response models.CarbCalculationResponse
 	if err := json.Unmarshal([]byte(jsonStr), &response); err != nil {
 		return s.createFallbackResponse(content), nil
